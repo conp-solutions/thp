@@ -1,0 +1,199 @@
+From effad88d2af155150fb5128a5ac97162c0449afb Mon Sep 17 00:00:00 2001
+From: Norbert Manthey <nmanthey@conp-solutions.com>
+Date: Sun, 3 May 2020 20:22:39 +0200
+Subject: [[RFC][PATCH] v1 2/2] malloc: improve THP effectiveness
+
+When allocating memory, the brk system call is used. However, the used
+granularity is a page size, typically 4K. To not drop from other default
+page sizes, this change makes sure we only jump to 2M as a huge page size
+if this increases the page size to be used.
+
+Furthermore, to improve the effectiveness of using huge pages, calls to
+brk are aligned to the page size to be used, namely 2M. As this change
+relies on a global value to be used, the state required for THP is moved
+to the global scope. Furthermore, the activation of the THP mechanism is
+moved to a new function.
+
+As allocations with brk can now be aligned, this feature can be activated
+separately, by defining the system variable GLIBC_THP_2M_FRIEDNLY.
+
+Signed-off-by: Norbert Manthey <nmanthey@conp-solutions.com>
+---
+ malloc/arena.c  |  2 +-
+ malloc/malloc.c | 91 ++++++++++++++++++++++++++++++++++++++++---------
+ 2 files changed, 75 insertions(+), 18 deletions(-)
+
+diff --git a/malloc/arena.c b/malloc/arena.c
+index 9941ea96ff..1ba7126aaa 100644
+--- a/malloc/arena.c
++++ b/malloc/arena.c
+@@ -456,7 +456,7 @@ new_heap (size_t size, size_t top_pad)
+   char *p1, *p2;
+   unsigned long ul;
+   heap_info *h;
+-  const size_t mmap_pagesize = 0x200000 > pagesize ? 0x200000 : pagesize;
++  const size_t mmap_pagesize = sys_thp_mmap_pagesize > pagesize ? sys_thp_mmap_pagesize : pagesize;
+   int extra_mmap_flags = (21 << MAP_HUGE_SHIFT);
+ 
+   if (size + top_pad < HEAP_MIN_SIZE)
+diff --git a/malloc/malloc.c b/malloc/malloc.c
+index cb179b95de..9c93732b10 100644
+--- a/malloc/malloc.c
++++ b/malloc/malloc.c
+@@ -1894,37 +1894,63 @@ free_perturb (char *p, size_t n)
+ 
+ /* ----------- Routines dealing with transparent huge pages ----------- */
+ 
++const static int sys_thp_pagesize = 0x200000; /* page size to be used */
++
++/* allow to select during compile time already, off by default */
++#ifndef SYS_THP_ALWAYS_ENABLED
++static int sys_thp_initialized = 0; /* have we checked the environment? */
++static int sys_thp_engaged = 0; /* shall we use THP and align 2M pages? */
++static int sys_thp_mmap_pagesize = 0; /* by default, do not set any extra page size */
++#else
++static int sys_thp_initialized = 1; /* have we checked the environment? */
++static int sys_thp_engaged = 1; /* shall we use THP and align 2M pages? */
++static int sys_thp_mmap_pagesize = 0x200000; /* by default, do not set any extra page size */
++#endif
++
++/*
++   check environment variable GLIBC_THP_ALWAYS whether we should try to
++   align to 2M pages and run madvise(..., MADV_HUGEPAGE) for all alocated
++   memory
++
++   In case the variable GLIBC_THP_2M_FRIEDNLY is specified, try to align the
++   allocations to 2M, so that external THP can be more effective.
++ */
++static int
++systhp_initialize(void)
++{
++  if (!sys_thp_initialized)
++  {
++    sys_thp_engaged = (getenv("GLIBC_THP_ALWAYS") != NULL);
++    sys_thp_initialized = 1;
++
++    /* align to 2M if using sys_thp, or when trying to be THP friednly */
++    if(sys_thp_engaged || getenv("GLIBC_THP_2M_FRIEDNLY") != NULL)
++      sys_thp_mmap_pagesize = sys_thp_pagesize;
++  }
++  return sys_thp_engaged;
++}
++
+ /*
+    systhp asks OS to use a huge page to back the current memory
+  */
+ static int
+ systhp(void* p, INTERNAL_SIZE_T size)
+ {
+-  static int initialized = 0;
+-  static int use_thp = 0;
+-
+   /* do not consider areas smaller than a huge page */
+-  if(size < 0x200000)
++  if(size < sys_thp_pagesize)
+     return 0;
+ 
+-  /* use transparent huge pages, if requested */
+-  if (!initialized) {
+-    use_thp = (getenv("GLIBC_THP_ALWAYS") != NULL);
+-    initialized = 1;
+-  }
+-
+   /* ask for huge page, if enabled and aligned */
+-  if (!use_thp)
++  if (!sys_thp_engaged)
+     return 0;
+ 
+   /* ensure we use only 2M aligned addresses */
+   if(((unsigned long)p & 0x1fffff) != 0)
+   {
+     /* get smallest 2M aligned address and size within 2M pages */
+-    const size_t mmap_pagesize = 0x200000;
+-    unsigned long q = ALIGN_UP ((unsigned long)p, mmap_pagesize);
++    unsigned long q = ALIGN_UP ((unsigned long)p, sys_thp_pagesize);
+     unsigned long top = (unsigned long)p + size;
+-    top = ALIGN_DOWN(top, mmap_pagesize);
++    top = ALIGN_DOWN(top, sys_thp_pagesize);
+ 
+     /* abort if requested area does not contain a huge page */
+     if(top <= q)
+@@ -2336,9 +2362,16 @@ sysmalloc (INTERNAL_SIZE_T nb, mstate av)
+ 
+   size_t pagesize = GLRO (dl_pagesize);
+   bool tried_mmap = false;
+-  const size_t mmap_pagesize = 0x200000 > pagesize ? 0x200000 : pagesize;
++
++  size_t mmap_pagesize;
+   int extra_mmap_flags = (21 << MAP_HUGE_SHIFT);
+ 
++  systhp_initialize();
++  mmap_pagesize = sys_thp_mmap_pagesize > pagesize ? sys_thp_mmap_pagesize : pagesize;
++
++  long align_size;      /* size to use to align brk (top of heap) */
++  char *aligned_2m_brk; /* value of updated brk prior to alignment */
++
+   /*
+      If have mmap, and the request size meets the mmap threshold, and
+      the system supports mmap, and there are few enough currently
+@@ -2539,6 +2572,26 @@ sysmalloc (INTERNAL_SIZE_T nb, mstate av)
+ 
+       if (brk != (char *) (MORECORE_FAILURE))
+         {
++	  /*
++	     Try to align heap top to 2M page size. This allows to use huge
++	     pages for any future MORECORE call.
++	   */
++	  if(sys_thp_mmap_pagesize > 0 && ((unsigned long)brk & 0x1fffff) != 0)
++	  {
++	    align_size = sys_thp_pagesize - ((unsigned long)brk & 0x1fffff);
++
++	    aligned_2m_brk = (char *) (MORECORE (align_size));
++            LIBC_PROBE (memory_sbrk_more, 2, brk, align_size);
++
++	    assert((((unsigned long)aligned_2m_brk + align_size) & 0x1fffff) == 0); /* make sure top is now aligned */
++
++	    /* ignore failures for now */
++	    if (aligned_2m_brk != (char *) (MORECORE_FAILURE))
++	    {
++	      size += align_size;
++	    }
++	  }
++
+           /* use huge pages */
+           systhp(brk, size);
+ 
+@@ -2821,16 +2874,20 @@ systrim (size_t pad, mstate av)
+   char *new_brk;         /* address returned by post-check sbrk call */
+   size_t pagesize;
+   long top_area;
++  size_t mmap_pagesize;
+ 
+   pagesize = GLRO (dl_pagesize);
+   top_size = chunksize (av->top);
+ 
++  systhp_initialize();
++  mmap_pagesize = sys_thp_mmap_pagesize > pagesize ? sys_thp_mmap_pagesize : pagesize;
++
+   top_area = top_size - MINSIZE - 1;
+   if (top_area <= pad)
+     return 0;
+ 
+   /* Release in pagesize units and round down to the nearest page.  */
+-  extra = ALIGN_DOWN(top_area - pad, pagesize);
++  extra = ALIGN_DOWN(top_area - pad, mmap_pagesize);
+ 
+   if (extra == 0)
+     return 0;
+@@ -2921,7 +2978,7 @@ mremap_chunk (mchunkptr p, size_t new_size)
+   INTERNAL_SIZE_T offset = prev_size (p);
+   INTERNAL_SIZE_T size = chunksize (p);
+   char *cp;
+-  const size_t mmap_pagesize = 0x200000 > pagesize ? 0x200000 : pagesize;
++  const size_t mmap_pagesize = sys_thp_mmap_pagesize > pagesize ? sys_thp_mmap_pagesize : pagesize;
+   const int extra_mmap_flags = (21 << MAP_HUGE_SHIFT);
+ 
+   assert (chunk_is_mmapped (p));
+-- 
+2.25.1
+

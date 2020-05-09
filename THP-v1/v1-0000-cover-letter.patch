@@ -1,0 +1,62 @@
+From effad88d2af155150fb5128a5ac97162c0449afb Mon Sep 17 00:00:00 2001
+From: Norbert Manthey <nmanthey@conp-solutions.com>
+Date: Sun, 3 May 2020 23:42:02 +0200
+Subject: [[RFC][PATCH] v1 0/2] malloc/realloc with transparent huge page support
+
+Dear all,
+
+I have been looking for a way to enable huge pages in a user land process
+without privileges, and without modifying the source of the process.
+
+Huge pages had to be used explicitly via linking against special libraries.
+An alternative are transparent huge pages, which are easier to obtain, but there
+are no guarantees of success. Using transparent huge pages can also result in
+slowdowns. Many Linux based distributions enable transparent huge pages via
+madvise, so that user land processes. With the madvise system call, a process
+can control whether allocated memory should be mapped with huge pages. However,
+the process typically only sees the allocations returned via a single malloc or
+realloc invocation, most of them being rather small.
+
+For a larger impact, I modified the way allocations are done behind the scenes.
+For the allocated memory, I changed the properties to (1) align to 2M instead
+of 4K, and (2) to call the madvise system call after the brk system call, to
+signal that the used memory area should be mapped with huge pages.
+
+The default behavior is not modified. The modification can currently be enabled,
+by specifying the environment variable GLIBC_THP_ALWAYS.
+
+### Testing Done
+
+This change has been tested on top of glibc 2.23 in an Ubuntu 16.04 environment
+for programs that benefit from huge pages due to their large memory usage and
+pseudo-random memory access patterns (e.g. SAT solvers, model checkers,
+optimization tools an others). More details on the performance improvements for
+these tools can be found in https://arxiv.org/abs/2004.14378, e.g. page 9.
+
+#### glibc tests
+
+Both "make check" and "make xcheck" have not introduced regressions. I tested
+on a Ubuntu 20.04, with gcc-9.3 and an Intel(R) Core(TM) i7-5600U CPU.
+
+### Stable branches
+
+I have a set of these patches to be applied to the 2.23 version of glibc. These
+patches had to be slightly adapted to be applicable to the current master
+branch. Intermediate versions of glibc might require small adaption. The patches
+for glibc-2.23 are available at:
+https://github.com/conp-solutions/thp/tree/master/ubuntu16.04-thp-env-2.23
+
+Best,
+Norbert
+
+Norbert Manthey (2):
+  malloc: support transparent huge pages
+  malloc: improve THP effectiveness
+
+ malloc/arena.c  |  14 +++--
+ malloc/malloc.c | 144 ++++++++++++++++++++++++++++++++++++++++++++----
+ 2 files changed, 143 insertions(+), 15 deletions(-)
+
+-- 
+2.25.1
+
