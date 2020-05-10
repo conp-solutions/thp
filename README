@@ -1,1 +1,31 @@
+thp, Norbert Manthey, 2020
+
+# Overview
+
+This repository contains patches to add transparent huge pages to glibc,
+as well as tooling to test these changes, and use the available patches although
+they are not integrated into glibc yet.
+
+# Examples
+
+### Use container to statically link tool against environment THP libc.a file
+
+ CONTAINER=$(docker build -q docker)
+ cd <the directory of your tool>
+ docker run -v "$PWD":"$PWD" -w "$PWD" "$CONTAINER" <static-linking-build-command>
+ GLIBC_THP_ALWAYS=1 <your-statically-linked-tool> $PARAMETER
+ 
+To check whether huge pages are used, you can run the following in a separate
+terminal:
+ 
+ watch -n 1 "cat /proc/meminfo | grep -i huge"
+
+# Content
+
 Initial patches for Ubuntu 16.04 glibc
+
+README ......................... This file
+docker ......................... Directory with files for Docker based testing
+THP-v1 ......................... Version 1 of patches published for glibc 2.31
+ubuntu16.04-thp-activated-2.23 . Ubuntu 16.04 patches, default activated THP
+ubuntu16.04-thp-env-2.23 ....... Ubuntu 16.04 patches
