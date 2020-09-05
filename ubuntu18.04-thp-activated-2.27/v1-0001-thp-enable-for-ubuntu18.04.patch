@@ -1,0 +1,345 @@
+From 829bdcf6ef7c65a1a668c7376747e553993b2859 Mon Sep 17 00:00:00 2001
+From: Norbert Manthey <nmanthey@conp-solutions.com>
+Date: Sat, 5 Sep 2020 13:46:21 +0200
+Subject: [[PATCH] v1 1/1] thp: enable for ubuntu18.04
+
+Signed-off-by: Norbert Manthey <nmanthey@conp-solutions.com>
+---
+ malloc/arena.c  |  14 +++--
+ malloc/malloc.c | 143 ++++++++++++++++++++++++++++++++++++++++++++----
+ 2 files changed, 142 insertions(+), 15 deletions(-)
+
+diff --git a/malloc/arena.c b/malloc/arena.c
+index 37183cfb6a..93b56f6bbf 100644
+--- a/malloc/arena.c
++++ b/malloc/arena.c
+@@ -455,6 +455,8 @@ new_heap (size_t size, size_t top_pad)
+   char *p1, *p2;
+   unsigned long ul;
+   heap_info *h;
++  const size_t mmap_pagesize = sys_thp_mmap_pagesize > pagesize ? sys_thp_mmap_pagesize : pagesize;
++  int extra_mmap_flags = (21 << MAP_HUGE_SHIFT);
+ 
+   if (size + top_pad < HEAP_MIN_SIZE)
+     size = HEAP_MIN_SIZE;
+@@ -464,7 +466,7 @@ new_heap (size_t size, size_t top_pad)
+     return 0;
+   else
+     size = HEAP_MAX_SIZE;
+-  size = ALIGN_UP (size, pagesize);
++  size = ALIGN_UP (size, mmap_pagesize);
+ 
+   /* A memory region aligned to a multiple of HEAP_MAX_SIZE is needed.
+      No swap space needs to be reserved for the following large
+@@ -474,7 +476,7 @@ new_heap (size_t size, size_t top_pad)
+   if (aligned_heap_area)
+     {
+       p2 = (char *) MMAP (aligned_heap_area, HEAP_MAX_SIZE, PROT_NONE,
+-                          MAP_NORESERVE);
++                          MAP_NORESERVE | extra_mmap_flags);
+       aligned_heap_area = NULL;
+       if (p2 != MAP_FAILED && ((unsigned long) p2 & (HEAP_MAX_SIZE - 1)))
+         {
+@@ -484,7 +486,7 @@ new_heap (size_t size, size_t top_pad)
+     }
+   if (p2 == MAP_FAILED)
+     {
+-      p1 = (char *) MMAP (0, HEAP_MAX_SIZE << 1, PROT_NONE, MAP_NORESERVE);
++      p1 = (char *) MMAP (0, HEAP_MAX_SIZE << 1, PROT_NONE, MAP_NORESERVE | extra_mmap_flags);
+       if (p1 != MAP_FAILED)
+         {
+           p2 = (char *) (((unsigned long) p1 + (HEAP_MAX_SIZE - 1))
+@@ -500,7 +502,7 @@ new_heap (size_t size, size_t top_pad)
+         {
+           /* Try to take the chance that an allocation of only HEAP_MAX_SIZE
+              is already aligned. */
+-          p2 = (char *) MMAP (0, HEAP_MAX_SIZE, PROT_NONE, MAP_NORESERVE);
++          p2 = (char *) MMAP (0, HEAP_MAX_SIZE, PROT_NONE, MAP_NORESERVE | extra_mmap_flags);
+           if (p2 == MAP_FAILED)
+             return 0;
+ 
+@@ -516,6 +518,10 @@ new_heap (size_t size, size_t top_pad)
+       __munmap (p2, HEAP_MAX_SIZE);
+       return 0;
+     }
++
++  /* use huge pages */
++  systhp(p2, size);
++
+   h = (heap_info *) p2;
+   h->size = size;
+   h->mprotect_size = size;
+diff --git a/malloc/malloc.c b/malloc/malloc.c
+index f8e7250f70..8ca57169c7 100644
+--- a/malloc/malloc.c
++++ b/malloc/malloc.c
+@@ -442,7 +442,7 @@ void *(*__morecore)(ptrdiff_t) = __default_morecore;
+    thus avoid running out of kernel resources.  */
+ 
+ #ifndef MMAP_AS_MORECORE_SIZE
+-#define MMAP_AS_MORECORE_SIZE (1024 * 1024)
++#define MMAP_AS_MORECORE_SIZE (2 * 1024 * 1024)
+ #endif
+ 
+ /*
+@@ -1899,6 +1899,79 @@ free_perturb (char *p, size_t n)
+ 
+ #include <stap-probe.h>
+ 
++/* ----------- Routines dealing with transparent huge pages ----------- */
++
++const static int sys_thp_pagesize = 0x200000; /* page size to be used */
++
++#define SYS_THP_ALWAYS_ENABLED /* allow to select during compile time already, off by default */
++#ifndef SYS_THP_ALWAYS_ENABLED
++static int sys_thp_initialized = 0; /* have we checked the environment? */
++static int sys_thp_engaged = 0; /* shall we use THP and align 2M pages? */
++static int sys_thp_mmap_pagesize = 0; /* by default, do not set any extra page size */
++#else
++static int sys_thp_initialized = 1; /* have we checked the environment? */
++static int sys_thp_engaged = 1; /* shall we use THP and align 2M pages? */
++static int sys_thp_mmap_pagesize = 0x200000; /* by default, do not set any extra page size */
++#endif
++
++/*
++   check environment variable GLIBC_THP_ALWAYS whether we should try to
++   align to 2M pages and run madvise(..., MADV_HUGEPAGE) for all alocated
++   memory
++
++   In case the variable GLIBC_THP_2M_FRIEDNLY is specified, try to align the
++   allocations to 2M, so that external THP can be more effective.
++ */
++static int
++systhp_initialize(void)
++{
++  if (!sys_thp_initialized)
++  {
++    sys_thp_engaged = (getenv("GLIBC_THP_ALWAYS") != NULL);
++    sys_thp_initialized = 1;
++
++    /* align to 2M if using sys_thp, or when trying to be THP friednly */
++    if(sys_thp_engaged || getenv("GLIBC_THP_2M_FRIEDNLY") != NULL)
++      sys_thp_mmap_pagesize = sys_thp_pagesize;
++  }
++  return sys_thp_engaged;
++}
++
++/*
++   systhp asks OS to use a huge page to back the current memory
++ */
++static int
++systhp(void* p, INTERNAL_SIZE_T size)
++{
++  /* do not consider areas smaller than a huge page */
++  if(size < sys_thp_pagesize)
++    return 0;
++
++  /* ask for huge page, if enabled and aligned */
++  if (!sys_thp_engaged)
++    return 0;
++
++  /* ensure we use only 2M aligned addresses */
++  if(((unsigned long)p & 0x1fffff) != 0)
++  {
++    /* get smallest 2M aligned address and size within 2M pages */
++    unsigned long q = ALIGN_UP ((unsigned long)p, sys_thp_pagesize);
++    unsigned long top = (unsigned long)p + size;
++    top = ALIGN_DOWN(top, sys_thp_pagesize);
++
++    /* abort if requested area does not contain a huge page */
++    if(top <= q)
++      return 0;
++
++    /* update area to be backed with huge pages */
++    p = (void *)q;
++    size = top - q;
++  }
++
++  /* ask for huge page, if enabled and aligned */
++  return __madvise (p, size, MADV_HUGEPAGE);
++}
++
+ /* ------------------- Support for multiple arenas -------------------- */
+ #include "arena.c"
+ 
+@@ -2294,6 +2367,14 @@ sysmalloc (INTERNAL_SIZE_T nb, mstate av)
+   size_t pagesize = GLRO (dl_pagesize);
+   bool tried_mmap = false;
+ 
++  size_t mmap_pagesize;
++  int extra_mmap_flags = (21 << MAP_HUGE_SHIFT);
++
++  systhp_initialize();
++  mmap_pagesize = sys_thp_mmap_pagesize > pagesize ? sys_thp_mmap_pagesize : pagesize;
++
++  long align_size;      /* size to use to align brk (top of heap) */
++  char *aligned_2m_brk; /* value of updated brk prior to alignment */
+ 
+   /*
+      If have mmap, and the request size meets the mmap threshold, and
+@@ -2318,15 +2399,15 @@ sysmalloc (INTERNAL_SIZE_T nb, mstate av)
+          need for further alignments unless we have have high alignment.
+        */
+       if (MALLOC_ALIGNMENT == 2 * SIZE_SZ)
+-        size = ALIGN_UP (nb + SIZE_SZ, pagesize);
++        size = ALIGN_UP (nb + SIZE_SZ, mmap_pagesize);
+       else
+-        size = ALIGN_UP (nb + SIZE_SZ + MALLOC_ALIGN_MASK, pagesize);
++        size = ALIGN_UP (nb + SIZE_SZ + MALLOC_ALIGN_MASK, mmap_pagesize);
+       tried_mmap = true;
+ 
+       /* Don't try if size wraps around 0 */
+       if ((unsigned long) (size) > (unsigned long) (nb))
+         {
+-          mm = (char *) (MMAP (0, size, PROT_READ | PROT_WRITE, 0));
++          mm = (char *) (MMAP (0, size, PROT_READ | PROT_WRITE, extra_mmap_flags));
+ 
+           if (mm != MAP_FAILED)
+             {
+@@ -2338,6 +2419,9 @@ sysmalloc (INTERNAL_SIZE_T nb, mstate av)
+                  address argument for later munmap in free() and realloc().
+                */
+ 
++              /* use huge pages */
++              systhp(mm, size);
++
+               if (MALLOC_ALIGNMENT == 2 * SIZE_SZ)
+                 {
+                   /* For glibc, chunk2mem increases the address by 2*SIZE_SZ and
+@@ -2476,7 +2560,7 @@ sysmalloc (INTERNAL_SIZE_T nb, mstate av)
+          previous calls. Otherwise, we correct to page-align below.
+        */
+ 
+-      size = ALIGN_UP (size, pagesize);
++      size = ALIGN_UP (size, mmap_pagesize);
+ 
+       /*
+          Don't try to call MORECORE if argument is so big as to appear
+@@ -2492,6 +2576,29 @@ sysmalloc (INTERNAL_SIZE_T nb, mstate av)
+ 
+       if (brk != (char *) (MORECORE_FAILURE))
+         {
++	  /*
++	     Try to align heap top to 2M page size. This allows to use huge
++	     pages for any future MORECORE call.
++	   */
++	  if(sys_thp_mmap_pagesize > 0 && ((unsigned long)brk & 0x1fffff) != 0)
++	  {
++	    align_size = sys_thp_pagesize - ((unsigned long)brk & 0x1fffff);
++
++	    aligned_2m_brk = (char *) (MORECORE (align_size));
++            LIBC_PROBE (memory_sbrk_more, 2, brk, align_size);
++
++	    assert((((unsigned long)aligned_2m_brk + align_size) & 0x1fffff) == 0); /* make sure top is now aligned */
++
++	    /* ignore failures for now */
++	    if (aligned_2m_brk != (char *) (MORECORE_FAILURE))
++	    {
++	      size += align_size;
++	    }
++	  }
++
++          /* use huge pages */
++          systhp(brk, size);
++
+           /* Call the `morecore' hook if necessary.  */
+           void (*hook) (void) = atomic_forced_read (__after_morecore_hook);
+           if (__builtin_expect (hook != NULL, 0))
+@@ -2510,7 +2617,7 @@ sysmalloc (INTERNAL_SIZE_T nb, mstate av)
+ 
+           /* Cannot merge with old top, so add its size back in */
+           if (contiguous (av))
+-            size = ALIGN_UP (size + old_size, pagesize);
++            size = ALIGN_UP (size + old_size, mmap_pagesize);
+ 
+           /* If we are relying on mmap as backup, then use larger units */
+           if ((unsigned long) (size) < (unsigned long) (MMAP_AS_MORECORE_SIZE))
+@@ -2519,10 +2626,14 @@ sysmalloc (INTERNAL_SIZE_T nb, mstate av)
+           /* Don't try if size wraps around 0 */
+           if ((unsigned long) (size) > (unsigned long) (nb))
+             {
+-              char *mbrk = (char *) (MMAP (0, size, PROT_READ | PROT_WRITE, 0));
++              char *mbrk = (char *) (MMAP (0, size, PROT_READ | PROT_WRITE, extra_mmap_flags));
+ 
+               if (mbrk != MAP_FAILED)
+                 {
++
++                  /* use huge pages */
++                  systhp(mbrk, size);
++
+                   /* We do not need, and cannot use, another sbrk call to find end */
+                   brk = mbrk;
+                   snd_brk = brk + size;
+@@ -2614,7 +2725,7 @@ sysmalloc (INTERNAL_SIZE_T nb, mstate av)
+ 
+                   /* Extend the end address to hit a page boundary */
+                   end_misalign = (INTERNAL_SIZE_T) (brk + size + correction);
+-                  correction += (ALIGN_UP (end_misalign, pagesize)) - end_misalign;
++                  correction += (ALIGN_UP (end_misalign, mmap_pagesize)) - end_misalign;
+ 
+                   assert (correction >= 0);
+                   snd_brk = (char *) (MORECORE (correction));
+@@ -2636,6 +2747,7 @@ sysmalloc (INTERNAL_SIZE_T nb, mstate av)
+                     }
+                   else
+                     {
++		      systhp(snd_brk, correction);
+                       /* Call the `morecore' hook if necessary.  */
+                       void (*hook) (void) = atomic_forced_read (__after_morecore_hook);
+                       if (__builtin_expect (hook != NULL, 0))
+@@ -2766,16 +2878,20 @@ systrim (size_t pad, mstate av)
+   char *new_brk;         /* address returned by post-check sbrk call */
+   size_t pagesize;
+   long top_area;
++  size_t mmap_pagesize;
+ 
+   pagesize = GLRO (dl_pagesize);
+   top_size = chunksize (av->top);
+ 
++  systhp_initialize();
++  mmap_pagesize = sys_thp_mmap_pagesize > pagesize ? sys_thp_mmap_pagesize : pagesize;
++
+   top_area = top_size - MINSIZE - 1;
+   if (top_area <= pad)
+     return 0;
+ 
+   /* Release in pagesize units and round down to the nearest page.  */
+-  extra = ALIGN_DOWN(top_area - pad, pagesize);
++  extra = ALIGN_DOWN(top_area - pad, mmap_pagesize);
+ 
+   if (extra == 0)
+     return 0;
+@@ -2863,23 +2979,28 @@ mremap_chunk (mchunkptr p, size_t new_size)
+   INTERNAL_SIZE_T offset = prev_size (p);
+   INTERNAL_SIZE_T size = chunksize (p);
+   char *cp;
++  const size_t mmap_pagesize = sys_thp_mmap_pagesize > pagesize ? sys_thp_mmap_pagesize : pagesize;
++  int extra_mmap_flags = (21 << MAP_HUGE_SHIFT);
+ 
+   assert (chunk_is_mmapped (p));
+   assert (((size + offset) & (GLRO (dl_pagesize) - 1)) == 0);
+ 
+   /* Note the extra SIZE_SZ overhead as in mmap_chunk(). */
+-  new_size = ALIGN_UP (new_size + offset + SIZE_SZ, pagesize);
++  new_size = ALIGN_UP (new_size + offset + SIZE_SZ, mmap_pagesize);
+ 
+   /* No need to remap if the number of pages does not change.  */
+   if (size + offset == new_size)
+     return p;
+ 
+   cp = (char *) __mremap ((char *) p - offset, size + offset, new_size,
+-                          MREMAP_MAYMOVE);
++                          MREMAP_MAYMOVE | extra_mmap_flags);
+ 
+   if (cp == MAP_FAILED)
+     return 0;
+ 
++  /* use huge pages */
++  systhp(cp, new_size);
++
+   p = (mchunkptr) (cp + offset);
+ 
+   assert (aligned_OK (chunk2mem (p)));
+-- 
+2.25.1
+
